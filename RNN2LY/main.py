@@ -2,9 +2,12 @@ from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
 
+from torch.optim import AdamW
+
 from model.encoderRNN import PreEncoderRNN
 from model.decoderRNN import DecoderRNN
 from model.seq2seq import Seq2Seq
+from model import config_loader
 from evaluator import Evaluator
 from loss import bbox_loss
 
@@ -21,8 +24,12 @@ from tqdm import tqdm
 import collections
 
 import os
+import traceback
 
 import pickle
+
+import shutil
+
 
 # Dataloader
 BATCH_SIZE = 32
@@ -30,42 +37,47 @@ NUM_WORKERS = 4
 SHUFFLE = True
 PIN_MEMORY = True
 
+#encoder-decoder
+CONFIG_FILE_PATH = './checkpoints/current_config.json'
+PRETRAINED_ENCODER=False #im never gonna use it ngl
+GPU_INDEX = 0
+
 # Dataset hyperparameters
-IMAGE_SIZE = (256, 256)
 UQ_CAP = True # Use one caption or all the captions. Values: False -> All the captions. True -> One caption
-HIDDEN_SIZE = 256
-MAX_OBJECTS = 10 # Maximum number of objects to use from the dataset
 NORMALIZE_INPUT = True # Normalize the pictures to range [0, 1].
-BIDIRECTIONAL = True # Use a bidirectional encoder
-USE_ATTENTION = False # use attention in the decoder
-XY_DISTRIBUTION_SIZE = 32 # Size of grid use in the picture to approximate the bounding boxes.
 
 # Training
-EPOCHS = 10 # Number of epochs to train
-PRINT_EVERY = 50 # Print information about the model every n steps
+STARTING_EPOCH = 0 #epoch to start  training back from. The STARTING_EPOCH th model, ie. model with index STARTING_EPOCH-1 will be loaded from CHECKPOINTS_PATH. If STARTING_EPOCH=0 or less no epoch will be loaded.
+EPOCHS = 100 # Number of epochs to train
+PRINT_EVERY = 500 # Print information about the model every n steps
 IS_TRAINING = True # Set the model to training or validation. Values: True -> Training mode. False -> Validation mode
-CHECKPOINTS_PATH = "./checkpoints/4" # Path to save the epochs and average losses
-PRETRAINED_ENCODER = False # Use the pretrained encoder
-FREEZE_ENCODER = True # Freeze the weights of the encoder
-VOCAB_PATH = "./data/captions.pickle" # Path of the pretrained vocab
-ENCODER_PATH = "./data/text_encoder100.pth" # Path of the pretrained encoder
+CHECKPOINTS_PATH = "./checkpoints/lmao" # Path to save the epochs and average losses
+LEARNING_RATE = 5e-5
 
 # Validation
 CALCULATE_GAUSS_DICT = True # Gauss dictionary with means and std for the objects in the dataset. Values: True -> calculates and saves the gaussian dict. False -> Uses the file located at GAUSS_DICT_PATH  
 GAUSS_DICT_PATH = "./data/gaussian_dict_full.npy" # Path to the gauss dict
-VALIDATION_OUTPUT = "./evaluator_output/4" # Path to save the output (bbox and class for each picture)
+VALIDATION_OUTPUT = "./evaluator_output/lmao" # Path to save the output (bbox and class for each picture)
 SAVE_OUTPUT = True # Whether to save or not the output (bbox and class for each picture) when validating. Values: True -> the output is saved. False -> The output is not saved
-EPOCH_VALIDATION = 26 # Number of the epoch to validate
+EPOCHS_VALIDATION = list(range(STARTING_EPOCH,STARTING_EPOCH+EPOCHS))#list(range(0,EPOCHS,3)) # Number of the epoch to validate
 
-# Paths to the training, development and validation dataset
+#Paths to the training, development and validation dataset
 DATASET_PATH_TRAIN = "./data/datasets/AMR2014train-dev-test/GraphTrain.json"
+#DATASET_PATH_TRAIN = "./data/datasets/COCO/annotations/captions_train2014.json"
 INSTAN_PATH_TRAIN = "./data/datasets/COCO/annotations/instances_train2014.json"
+WHITE_LIST_PATH_TRAIN = None #"./data/datasets/COCO/annotations/train_white_list.json"
 
 DATASET_PATH_DEV = "./data/datasets/AMR2014train-dev-test/GraphDev.json"
+#DATASET_PATH_DEV = "./data/datasets/COCO/annotations/captions_train2014.json"
 INSTAN_PATH_DEV = "./data/datasets/COCO/annotations/instances_train2014.json"
+WHITE_LIST_PATH_DEV = None #"./data/datasets/COCO/annotations/dev_white_list.json"
 
-DATASET_PATH_VAL = "./data/datasets/AMR2014train-dev-test/GraphTest.json"
-INSTAN_PATH_VAL = "./data/datasets/COCO/annotations/instances_val2014.json"
+#we ratting
+DATASET_PATH_VAL = "./data/datasets/AMR2014train-dev-test/GraphDev.json"
+INSTAN_PATH_VAL = "./data/datasets/COCO/annotations/instances_train2014.json"
+
+#DATASET_PATH_VAL = "./data/datasets/AMR2014train-dev-test/GraphTest.json"
+#INSTAN_PATH_VAL = "./data/datasets/COCO/annotations/instances_val2014.json"
 
 def generate_dataset(dataset_path_train, instan_path_train, dataset_path_test, instan_path_test, 
                     normalize_input=True, uq_cap=False, max_objects=10,
@@ -82,7 +94,7 @@ def generate_dataset(dataset_path_train, instan_path_train, dataset_path_test, i
                 if j == 1 or j == 2:
                     continue
                 train_ds.vocab['word2count'][train_ds.vocab['index2word'][j.item()]] += 1
-                
+    
     print("Loading validation dataset")
     val_ds = CocoDataset(dataset_path_test, instan_path_test, normalize=normalize_input, vocab=train_ds.vocab, uq_cap=uq_cap, max_objects=max_objects, cap_lang=train_ds.cap_lang)
 
@@ -99,20 +111,6 @@ def generate_dataset(dataset_path_train, instan_path_train, dataset_path_test, i
     val_dl = DeviceDataLoader(val_dl, device)
 
     return train_dl, val_dl, train_ds.vocab, train_ds, val_ds
-
-def generate_encoder(n, bidirectional=True, hidden_size=128, image_size=(256, 256)):
-    """
-    Function to generate the encoder
-    """
-    encoder = PreEncoderRNN(n, ninput=300, drop_prob=0.5, nhidden=hidden_size, nlayers=1, bidirectional=bidirectional)
-    return encoder
-
-def generate_decoder(vocab, is_training, use_attention=False, bidirectional=True, hidden_size=128, xy_distribution_size=16):
-    """
-    Function to generate the decoder
-    """
-    decoder = DecoderRNN(vocab, hidden_size, is_training, use_attention=use_attention, bidirectional=bidirectional, xy_distribution_size=xy_distribution_size)
-    return decoder
 
 def generate_losses(vocab, train_ds):
     """
@@ -163,59 +161,103 @@ def calculate_gaussian_dict(train_ds):
         tmp_std = np.std(np.array(sta_dict[label]))
         gaussian_dict[label] = (tmp_mean, tmp_std)
     np.save(GAUSS_DICT_PATH, gaussian_dict)
+def select_device():
+    if GPU_INDEX is None:
+        device = get_default_device()
+        print("USING DEVICE", device)
+    else:
+        
+        device = torch.device('cuda:'+str(GPU_INDEX))
+        torch.cuda.device(device)
+        print("USING DEVICE",torch.cuda.get_device_name(device), device)
+        
+    return device
+def makedirs():
+    """
+    If needed creates the checkpoints path folder and the evaluator output path folders. Also saves the model configuration.
+    """
+    try:
+        os.makedirs(CHECKPOINTS_PATH+"/")
+        print("Checkpoints path "+CHECKPOINTS_PATH +" created")
+    except FileExistsError:
+        print("Checkpoints path "+CHECKPOINTS_PATH +" already existed")
+    except Exception as e:
+        print("Error while trying to create checkpoints path "+CHECKPOINTS_PATH, file=os.stderr)
+        print(e,file=os.stderr)
+    overwrite = 'y'
+    files_in_checkpoint = os.listdir(CHECKPOINTS_PATH+"/")
+    if 'model_config.json' in files_in_checkpoint:
+        overwrite = input("model_config.json already exists in checkpoints path. Would you like to overwrite it?[y/n]")
+    if overwrite == 'y' or overwrite == 'Y':
+        shutil.copyfile(CONFIG_FILE_PATH, CHECKPOINTS_PATH+"/model_config.json")
+        print("Current configuration saved to checkpoint folder")
+    else:
+        print("Continuing with current configuration but without permanently saving it.")
 
+    #if we're saving evaluator's output, make the folder for it
+    try:
+        if SAVE_OUTPUT:
+            os.makedirs(VALIDATION_OUTPUT+"/")
+            print("Evaluator_output path "+VALIDATION_OUTPUT+" created")
+    except FileExistsError:
+        print("Evaluator_output path "+VALIDATION_OUTPUT+" already existed")
+    except Exception as e:
+        print("Error while trying to create evaluator_output path "+VALIDATION_OUTPUT, file=os.stderr)
+        print(e,file=os.stderr)
 if __name__ == "__main__":
 
-    # Generate the dataset
-    if IS_TRAINING:
-        valg = DATASET_PATH_DEV
-        vali = INSTAN_PATH_DEV
-    else:
-        valg = DATASET_PATH_VAL
-        vali = INSTAN_PATH_VAL
+    device = select_device()
+    with torch.cuda.device(torch.device(device)):
+        #save model configuration (and create checkpoint folder if necessary)
+        makedirs()
+        # Generate the dataset
+        if IS_TRAINING:
+            valg = DATASET_PATH_DEV
+            vali = INSTAN_PATH_DEV
+            valw = WHITE_LIST_PATH_DEV
+        else:
+            valg = DATASET_PATH_VAL
+            vali = INSTAN_PATH_VAL
+            valw = None
+        #load model
+        seq2seq, model_configuration = config_loader.load_config(CONFIG_FILE_PATH)
+        seq2seq.change_is_training(IS_TRAINING)
+        seq2seq = to_device(seq2seq, device)
+        
+        # Load the vocabulary of the pretrianed model
+        idx2word, word2idx = None, None
+        if PRETRAINED_ENCODER:
+            x = pickle.load(open(VOCAB_PATH, 'rb'))
+            idx2word, word2idx = x[2], x[3]
+            del x
 
-    # Load the vocabulary of the pretrianed model
-    idx2word, word2idx = None, None
-    if PRETRAINED_ENCODER:
-        x = pickle.load(open(VOCAB_PATH, 'rb'))
-        idx2word, word2idx = x[2], x[3]
-        del x
+        # Generate the dataset
+        train_dl, val_dl, vocab, train_ds, val_ds = generate_dataset(DATASET_PATH_TRAIN, INSTAN_PATH_TRAIN, valg, vali, uq_cap=UQ_CAP, batch_size=BATCH_SIZE, max_objects=model_configuration['max_objs'], idx2word=idx2word, word2idx=word2idx)
 
-    # Generate the dataset
-    train_dl, val_dl, vocab, train_ds, val_ds = generate_dataset(DATASET_PATH_TRAIN, INSTAN_PATH_TRAIN, valg, vali, uq_cap=UQ_CAP, batch_size=BATCH_SIZE, max_objects=MAX_OBJECTS, idx2word=idx2word, word2idx=word2idx)
+        # Generate the losses
+        lloss, bloss_xy, bloss_wh = generate_losses(vocab, train_ds)
 
-    # Generate the seq2seq model
-    device = get_default_device()
-    print("USING DEVICE", device)
+        # Calculate gaussian dict and open the file
+        if CALCULATE_GAUSS_DICT:
+            calculate_gaussian_dict(train_ds)
+        gaussian_dict = np.load(GAUSS_DICT_PATH, allow_pickle=True).item()
+        
+        # Train or validate
+        if IS_TRAINING:
+            train = SupervisedTrainer(seq2seq, vocab, EPOCHS, PRINT_EVERY, lloss, bloss_xy, bloss_wh, BATCH_SIZE, model_configuration['hidden_size'], LEARNING_RATE, AdamW, len(train_dl), checkpoints_path=CHECKPOINTS_PATH, gaussian_dict=gaussian_dict, validator_output_path=VALIDATION_OUTPUT, save_output=SAVE_OUTPUT)        
+            if STARTING_EPOCH>0:
+                print("Loading '"+CHECKPOINTS_PATH + "/amr-gan" + str(STARTING_EPOCH-1) + ".pth'"+" as initial model weighs.")
+                seq2seq.load_state_dict(torch.load(CHECKPOINTS_PATH + "/amr-gan" + str(STARTING_EPOCH-1) + ".pth"))
+                train.train_epoches(train_dl, train_ds, val_dl, val_ds, start_epoch=STARTING_EPOCH)
+            else:
+                train.train_epoches(train_dl, train_ds, val_dl, val_ds)
+        else:
+            # Epoch to validate
+            print("evaluation results will be saved to "+ VALIDATION_OUTPUT)
+            for epoch in EPOCHS_VALIDATION:
+                print("evaluating" + CHECKPOINTS_PATH + "/amr-gan" + str(epoch) + ".pth")
+                seq2seq.load_state_dict(torch.load(CHECKPOINTS_PATH + "/amr-gan" + str(epoch) + ".pth"))
 
-    # Generate the seq2seq model
-    encoder, decoder = generate_encoder(train_ds.cap_lang.n_words, hidden_size=HIDDEN_SIZE), generate_decoder(vocab, IS_TRAINING, xy_distribution_size=XY_DISTRIBUTION_SIZE, use_attention=USE_ATTENTION, hidden_size=HIDDEN_SIZE)
-    
-    # Load the pretrained model
-    if PRETRAINED_ENCODER:
-        encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=lambda storage, loc: storage))
-
-    # +2 objects because we need to include the <sos> and <eos>
-    seq2seq = Seq2Seq(encoder, decoder, vocab, IS_TRAINING, max_len=MAX_OBJECTS+2, pretrained_encoder=PRETRAINED_ENCODER, freeze_encoder=FREEZE_ENCODER)
-    seq2seq = to_device(seq2seq, device)
-
-    # Generate the losses
-    lloss, bloss_xy, bloss_wh = generate_losses(vocab, train_ds)
-
-    # Calculate gaussian dict and open the file
-    if CALCULATE_GAUSS_DICT:
-        calculate_gaussian_dict(train_ds)
-    gaussian_dict = np.load(GAUSS_DICT_PATH, allow_pickle=True).item()
-
-    # Train or validate
-    if IS_TRAINING:
-        train = SupervisedTrainer(seq2seq, vocab, EPOCHS, PRINT_EVERY, lloss, bloss_xy, bloss_wh, BATCH_SIZE, HIDDEN_SIZE, 1e-3, torch.optim.Adam, len(train_dl), checkpoints_path=CHECKPOINTS_PATH, gaussian_dict=gaussian_dict, validator_output_path=VALIDATION_OUTPUT, save_output=SAVE_OUTPUT)        
-        train.train_epoches(train_dl, train_ds, val_dl, val_ds)
-    else:
-        # Epoch to validate
-        epoch = EPOCH_VALIDATION
-        seq2seq.load_state_dict(torch.load(CHECKPOINTS_PATH + "/amr-gan" + str(epoch) + ".pth"))
-
-        evaluator = Evaluator(seq2seq, lloss, bloss_xy, bloss_wh, vocab, gaussian_dict=gaussian_dict, validator_output_path=VALIDATION_OUTPUT, save_output=True, verbose=False, name="TESTING")
-        evaluator.evaluate(val_dl, val_ds, epoch, CHECKPOINTS_PATH)
-    
+                evaluator = Evaluator(seq2seq, lloss, bloss_xy, bloss_wh, vocab, gaussian_dict=gaussian_dict, validator_output_path=VALIDATION_OUTPUT, save_output=True, verbose=False, name="TESTING")
+                evaluator.evaluate(val_dl, val_ds, epoch, CHECKPOINTS_PATH)
+                

@@ -122,17 +122,18 @@ class CocoDataset(Dataset):
 
         # Delete the instances that has no coco objects
         total = 0
+        new_image_ids = self.image_ids.copy()
         for id in self.image_ids:
-            new = id if self.uq_cap else id.split("-")[0]
+            new = id.split("-")[0]
             if new not in self.image_id_to_objects:
-                self.image_ids.remove(id)
+                new_image_ids.remove(id)
                 total += 1
+        self.image_ids = new_image_ids
         
         print("Number of captions removed from the list without gt objects {}".format(total))
         if vocab_remove:
             self.vocab['word2count']["<sos>"] -= total
             self.vocab['word2count']["<eos>"] -= total
-
     # Lowercase, trim, and remove non-letter characters
     def normalize_string(self, s):
         # Now included in the dataset

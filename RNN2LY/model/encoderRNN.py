@@ -23,7 +23,6 @@ class PreEncoderRNN(nn.Module):
 
         self.define_module()
         self.init_weights()
-
     def define_module(self):
         self.encoder = nn.Embedding(self.ntoken, self.ninput)
         self.drop = nn.Dropout(self.drop_prob)

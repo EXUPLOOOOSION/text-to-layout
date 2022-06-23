@@ -1,26 +1,26 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-
 import numpy as np
 
 import random
 
 class Seq2Seq(nn.Module):
 
-    def __init__(self, encoder, decoder, vocab, is_training, max_len=12, teacher_learning=True, pretrained_encoder=False, freeze_encoder=False):
+    def __init__(self, encoder, decoder, vocab_size, pad_token, is_training, max_len=12, teacher_learning=True, pretrained_encoder=False, freeze_encoder=False, cap_lang=None):
         super(Seq2Seq, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.vocab = vocab
+        self.pad_token = pad_token
         self.teacher_learning = teacher_learning
-        self.output_l_size = len(vocab['index2word'])
+        self.output_l_size = vocab_size
         self.is_training = is_training
         self.max_len = max_len
         self.temperature = 0.4
         self.xy_distribution_size = self.decoder.xy_distribution_size
         self.pretrained_encoder = pretrained_encoder
         self.freeze_encoder = freeze_encoder
+        self.cap_lang = cap_lang
 
         if self.pretrained_encoder and self.freeze_encoder:
             for p in self.encoder.parameters():
@@ -32,77 +32,41 @@ class Seq2Seq(nn.Module):
         Function to update is_training value
         """
         self.is_training = is_training
-        self.decoder.is_training = is_training
+        if is_training:
+            self.train()
+        else:
+            self.eval()
+    def train(self):
+        self.is_training = True
+        for param in self.parameters():
+            param.requires_grad = True
+        self.decoder.train()
+        if not self.freeze_encoder:
+            self.encoder.train()
+        else:
+            self.encoder.eval()
+            for param in self.encoder.parameters():
+                param.requires_grad = False
 
-    def convert_objects_to_list(self, coco_boxes, coco_ids, coco_to_img):
-        """
-        Function to reorganize the bounding boxes and classes
-        """
-        # Longest sequence. The minimum value is 3 <sos> class <eos>
-        maximum = 3
-        target_l_variables_list, target_x_variables_list, target_y_variables_list, target_w_variables_list, target_h_variables_list = [], [], [], [], []
-        target_coco_to_img_list = []
-        # First split the class/bounding box in list according to which image belongs each one
-        for i in range(coco_to_img.max()+1):
-            object_idx = np.where(coco_to_img.cpu().numpy()==i)[0]
-            target_l_variables_list.append(coco_ids[object_idx[0]: object_idx[-1]+1])
-            target_x_variables_list.append(coco_boxes[:, 0][object_idx[0]: object_idx[-1]+1])
-            target_y_variables_list.append(coco_boxes[:, 1][object_idx[0]: object_idx[-1]+1])
-            target_w_variables_list.append(coco_boxes[:, 2][object_idx[0]: object_idx[-1]+1])
-            target_h_variables_list.append(coco_boxes[:, 3][object_idx[0]: object_idx[-1]+1])
-            target_coco_to_img_list.append(coco_to_img[object_idx[0]: object_idx[-1]+1])
-            maximum = max(maximum, len(target_l_variables_list[-1]))
+    def eval(self):
+        self.is_training = False
+        self.decoder.eval()
+        self.encoder.eval()
+        for param in self.parameters():
+            param.requires_grad = False
 
-        # here we add padding according to the caption that has the maximum number of objects
-        target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables = [], [], [], [], []
-        target_coco_to_img = []
-        for i in range(len(target_l_variables_list)):
-            s = len(target_l_variables_list[i])
-            target_l, target_x, target_y, target_w, target_h, target_c_t_i = torch.zeros(maximum, dtype=torch.int64), torch.zeros(maximum), torch.zeros(maximum), torch.zeros(maximum), torch.zeros(maximum), torch.empty(maximum).fill_(i)
-            target_l[:s], target_x[:s], target_y[:s], target_w[:s], target_h[:s], target_c_t_i[:s] = target_l_variables_list[i], target_x_variables_list[i], target_y_variables_list[i], target_w_variables_list[i], target_h_variables_list[i], target_coco_to_img_list[i]
-            target_l_variables.append(target_l)
-            target_x_variables.append(target_x)
-            target_y_variables.append(target_y)
-            target_w_variables.append(target_w)
-            target_h_variables.append(target_h)
-            target_coco_to_img.append(target_c_t_i)
-        target_l_variables = torch.stack(target_l_variables)
-        target_x_variables = torch.stack(target_x_variables)
-        target_y_variables = torch.stack(target_y_variables)
-        target_w_variables = torch.stack(target_w_variables)
-        target_h_variables = torch.stack(target_h_variables)
-        target_coco_to_img = torch.stack(target_coco_to_img)
-        
-        # Convert the x, y coordinates to coordinates in the grid
-        target_x_coordinates = torch.zeros((target_x_variables.shape[0], target_x_variables.shape[1]))
-        target_y_coordinates = torch.zeros((target_y_variables.shape[0], target_y_variables.shape[1]))
-        for i in range(target_x_variables.shape[1]):
-            coordinates = self.convert_to_coordinates(self.convert_from_coordinates(torch.cat((target_x_variables[:, i].unsqueeze(1), target_y_variables[:, i].unsqueeze(1)), dim=1)).argmax(1).unsqueeze(1))
-
-            target_x_coordinates[:, i] = coordinates[:, 0]
-            target_y_coordinates[:, i] = coordinates[:, 1]
-
-        target_x_variables = target_x_coordinates
-        target_y_variables = target_y_coordinates
-        # Convert to cuda   
-        if torch.cuda.is_available():
-            target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables, target_coco_to_img = target_l_variables.cuda(), target_x_variables.cuda(), target_y_variables.cuda(), target_w_variables.cuda(), target_h_variables.cuda(), target_coco_to_img.cuda()
-        return target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables, target_coco_to_img
-
-    def forward(self, captions_padded, captions_length, coco_boxes, coco_ids, coco_to_img):
-        
+    def forward(self, captions_padded, captions_length, target_l=None, target_x=None, target_y=None, target_w=None, target_h=None):
         # Store the matches
         l_match, total = 0, 0
-
-        # Obtain the targets
-        target_l, target_x, target_y, target_w, target_h, target_coco_to_img = self.convert_objects_to_list(coco_boxes, coco_ids, coco_to_img)
-
         # Encode the input
         encoder_output, encoder_hidden, include = self.encoder(captions_padded, captions_length)
-        
+        #print("d inbetweener")
+        #print(encoder_output.size())
         # Concatenate directions of the bidirectional lstm
         decoder_hidden = tuple([self._cat_directions(h) for h in encoder_hidden])
-        
+        #print("d inbetweener2")
+        #print(encoder_hidden[0].size())
+        #print(encoder_hidden[1].size())
         # Obtain the batch size
         batch_size = decoder_hidden[0].size(1)
 
@@ -113,14 +77,13 @@ class Seq2Seq(nn.Module):
         outputs_class = torch.zeros(trg_len, target_l.size(0), self.decoder.output_size)
         outputs_bbox = torch.zeros(trg_len, target_l.size(0), 4)
         outputs_bbox_xy = torch.zeros(trg_len, target_l.size(0), self.xy_distribution_size ** 2)
-        target_xy = torch.zeros(trg_len, target_l.size(0))
+        
         
         # Convert to cuda
         if torch.cuda.is_available():
             outputs_class = outputs_class.cuda()
             outputs_bbox = outputs_bbox.cuda()
             outputs_bbox_xy = outputs_bbox_xy.cuda()
-            target_xy = target_xy.cuda()
 
         # Create the <sos> token
         trg_l = torch.ones(batch_size, dtype=torch.long)
@@ -154,7 +117,7 @@ class Seq2Seq(nn.Module):
         else:
             next_l = None
             next_xy = None
-
+        #xy_out_sample = np.empty((batch_size,trg_len,1024))
         # Column by column
         for di in range(1, trg_len):
             # Obtain the output of the decoder
@@ -163,9 +126,12 @@ class Seq2Seq(nn.Module):
             # Save the prediction
             outputs_class[di] = class_prediction
             outputs_bbox[di, :, 2:] = wh_out
+            #cpu_xy_out = xy_out.cpu()
+            #xy_out_sample[:,di,:] = cpu_xy_out
 
             # Sample if the xy_coordinates are not calculated
             if xy_coordinates == None:
+                #xy_distance = F.normalize(xy_out, dim=1)
                 xy_distance = xy_out.div(self.temperature).exp()
                 xy_topi = torch.multinomial(xy_distance, 1)
                 xy_coordinates = self.convert_to_coordinates(xy_topi)
@@ -174,9 +140,6 @@ class Seq2Seq(nn.Module):
             outputs_bbox[di, :, :2] = xy_coordinates # (x, y) coordinates
             outputs_bbox_xy[di] = xy_out # xy probability distribution
             
-            # For calculating afterwards the losses we save the target again
-            target_xy[di] = self.convert_from_coordinates(torch.cat((target_x[:, di].unsqueeze(1), target_y[:, di].unsqueeze(1)), dim=1)).argmax(1)
-
             # When training use the real values of the step for the next one
             # When validating use the predicted values of the step for the next one
             top1 = class_prediction.argmax(1)
@@ -212,27 +175,66 @@ class Seq2Seq(nn.Module):
             if self.is_training:
                 # Calculate some stats about the output (correct matching without taking into account the padding)                target_tensor = target_l[:, di]
                 target_tensor = target_l[:, di]
-                non_padding = target_tensor.ne(self.vocab['word2index']['<pad>'])
+                non_padding = target_tensor.ne(self.pad_token)
                 l_correct = top1.view(-1).eq(target_tensor).masked_select(non_padding).sum().item()
                 l_match += l_correct
                 total += non_padding.sum().item()
+        #xy_out_sample.dump("xy_out_samples.txt")
+        #raise NotImplementedError('Inference without teacher learning not implemented in seq2seq for TRAN decoder')
         # Return all the information
         final_output = {
             "output_class": outputs_class,
             "output_bbox": outputs_bbox,
             "outputs_bbox_xy": outputs_bbox_xy,
-            "target_l": target_l,
-            "target_x": target_x,
-            "target_y": target_y,
-            "target_w": target_w,
-            "target_h": target_h,
-            "target_xy": target_xy,
             "l_match": l_match,
-            "total": total,
-            "coco_to_img": target_coco_to_img
+            "total": total
         }
         return final_output
+    def indexes_from_sentence(self, sentence):
+        # Tokenize a sentece
+        if "<sos>" in self.cap_lang.word2index:
+            seq = [self.cap_lang.word2index["<sos>"]]
+        else:
+            seq = []
+        if type(sentence) is list:
+            words = sentence
+        else:
+            words = sentence.split(' ')
+        for word in words:
+            if word in self.cap_lang.word2index:
+                seq.append(self.cap_lang.word2index[word])
+        if "<eos>" in self.cap_lang.word2index:
+            seq.append(self.cap_lang.word2index["<eos>"])
+        return seq
+    def pad_seq(self, seq, max_length, pad_token):
+        # Add padding to the sequence with a maximum of max_length
+        seq = torch.cat((seq, torch.LongTensor([pad_token for i in range(max_length - len(seq))], device=seq.device)))
+        return seq
+    def generate(self, raw_captions):
+        if self.cap_lang is None:
+            print("Cap lang not initialized. Can't tokenize raw captions for further processing.")
+            return None
+        encodings = [self.indexes_from_sentence(raw_caption) for raw_caption in raw_captions]
+        lengths = [len(encoding) for encoding in encodings]
+        max_length = max(lengths)
+        for encoding in encodings:
+            encoding += [0]*(max_length-len(encoding))
 
+        padded_encodings = torch.LongTensor(encodings)
+        lengths = torch.LongTensor(lengths)
+        #for some reason the model isn't made to work without targets even in eval mode.
+        target_l = torch.zeros((padded_encodings.size(0), self.max_len))
+        target_x,target_y,target_w,target_h=target_l,target_l,target_l,target_l
+
+        if torch.cuda.is_available():
+            padded_encodings = padded_encodings.cuda()
+            lengths = lengths.cuda()
+            target_l,target_x,target_y,target_w,target_h = target_l.cuda(),target_x.cuda(),target_y.cuda(),target_w.cuda(),target_h.cuda()
+        output = self(padded_encodings, lengths, target_l= target_l,target_x= target_x,target_y= target_y,target_w= target_w,target_h= target_h)
+        simplified_output = {} #only need actual output, not l_match or total. Clean it if necessary (make class selections, swap dimensions to be batch_size, seq_len)...
+        simplified_output['output_class'] = torch.argmax(output['output_class'], dim=2).permute(1,0)
+        simplified_output['output_bbox'] = output['output_bbox'].permute(1,0,2)
+        return simplified_output
     def _cat_directions(self, h):
         """ If the encoder is bidirectional, do the following transformation.
             (#directions * #layers, #batch, hidden_size) -> (#layers, #batch, #directions * hidden_size)
@@ -310,7 +312,7 @@ class Seq2Seq(nn.Module):
         number_of_sectors = self.xy_distribution_size
 
         # First obtain the coordinates of the matrix
-        x, y = ((input_coordinates*number_of_sectors) % (number_of_sectors**2)).floor_divide(number_of_sectors), input_coordinates.floor_divide(number_of_sectors)
+        x, y = input_coordinates % number_of_sectors, input_coordinates.div(number_of_sectors,rounding_mode='trunc')
 
         # Obtain the [x,y] value in [0, 1] range
         x_value = x.true_divide(number_of_sectors)

@@ -5,19 +5,22 @@ from torch.autograd import Variable
 
 from model.attention import Attention
 
+import sys
+
 class DecoderRNN(nn.Module):
     
-    def __init__(self, vocab, hidden_size, is_training, bbox_dimension=128, dropout_p=0.2, use_attention=False, bidirectional=False, xy_distribution_size=16):
+    def __init__(self, vocab_size, hidden_size, is_training, bbox_dimension=128, dropout_p=0.2, use_attention=False, bidirectional=False, xy_distribution_size=16, temperature=0.4, device=torch.cuda.current_device()):
 
         super(DecoderRNN, self).__init__()
+        self.device = device
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
-        self.output_size = len(vocab['index2word'])
+        self.output_size = vocab_size
         self.use_attention = use_attention
         self.bbox_dimension = bbox_dimension
         self.is_training = is_training
         self.xy_distribution_size = xy_distribution_size
-        self.temperature = 0.4
+        self.temperature = temperature
         # Class
         self.embedding = nn.Embedding(self.output_size, self.hidden_size)
         self.embedding_dropout = nn.Dropout(p=dropout_p)
@@ -33,17 +36,11 @@ class DecoderRNN(nn.Module):
         if self.use_attention:
             # Attention
             self.attention = Attention(self.hidden_size)
-        """    
         self.rnn = nn.LSTM(
             (2 if self.use_attention else 1) * self.hidden_size + 2 * self.bbox_dimension, 
             self.hidden_size, 
             1)
-        """
-        self.rnn = nn.GRU(
-            (2 if self.use_attention else 1) * self.hidden_size + 2 * self.bbox_dimension, 
-            self.hidden_size, 
-            1)
-
+        
         # Class prediction
         self.class_out = nn.Linear((3 if self.use_attention else 2) * self.hidden_size, self.output_size)
 
@@ -66,11 +63,12 @@ class DecoderRNN(nn.Module):
         target_h = target_h.unsqueeze(1)
         # target_l = [1, batch_size]
         # target_x, y, w, h = [batch_size, 1]
+
         
         # Concatenate the [x, y, w, h] coordinates
         target_xy = torch.cat((target_x, target_y), dim=1)
         target_wh = torch.cat((target_w, target_h), dim=1)
-        # target_xy,wh = [batch_size, 2]
+        # target_xy,wh = [batch_size,2]
 
         embedded_l = self.embedding(target_l)
         # embedded_l = [1, batch size, emb dim]
@@ -142,11 +140,18 @@ class DecoderRNN(nn.Module):
         # When evaluating we sample the xy values
         topi = None
         if self.is_training and next_xy != None:
+            xy_distance = xy_out.div(self.temperature).exp().clamp(min=1e-5, max=torch.finfo(torch.float32).max)
+            #xy_distance = F.log_softmax(xy_out.div(self.temperature), dim=1)
+            xy_topi = torch.multinomial(xy_distance, 1)
+            topi = self.convert_to_coordinates(xy_topi)
+            
             next_xy_decoder_input = self.next_xy_dropout(self.next_xy_input(next_xy))
             # next_xy_decoder_input = [batch_size, bbox_dimension]
         else:
             # Sample
-            xy_distance = xy_out.div(self.temperature).exp().clamp(min=1e-5, max=1e5)
+            #xy_distance = F.normalize(xy_out,dim=1)
+            xy_distance = xy_out.div(self.temperature).exp().clamp(min=1e-5, max=torch.finfo(torch.float32).max)
+            #xy_distance = F.log_softmax(xy_out.div(self.temperature), dim=1)
             xy_topi = torch.multinomial(xy_distance, 1)
             topi = self.convert_to_coordinates(xy_topi)
             next_xy_decoder_input = self.next_xy_dropout(self.next_xy_input(topi))
@@ -169,7 +174,7 @@ class DecoderRNN(nn.Module):
         number_of_sectors = self.xy_distribution_size
 
         # First obtain the coordinates of the matrix
-        x, y = ((input_coordinates*number_of_sectors) % (number_of_sectors**2)).floor_divide(number_of_sectors), input_coordinates.floor_divide(number_of_sectors)
+        x, y = input_coordinates % number_of_sectors, input_coordinates.div(number_of_sectors,rounding_mode='trunc')
 
         # Obtain the [x,y] value in [0, 1] range
         x_value = x.true_divide(number_of_sectors)

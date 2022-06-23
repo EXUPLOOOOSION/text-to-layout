@@ -5,122 +5,99 @@ import torch.nn.functional as F
 import numpy as np
 
 import random
-
+from transformers import AutoTokenizer
 class Seq2Seq(nn.Module):
 
-    def __init__(self, encoder, decoder, vocab, is_training, max_len=12, teacher_learning=True, pretrained_encoder=False, freeze_encoder=False):
+    def __init__(self, encoder, decoder, vocab_size, pad_token, is_training, max_len=12, teacher_learning=True, pretrained_encoder=False, freeze_encoder=False, device=torch.cuda.current_device()):
+        """
+        Initialization of the model that connects encoder and decoder.
+
+        Args:
+             encoder: instance of encoderBERT
+             decoder: instance of DecoderRNN
+             vocab_size: number of possible class outputs. Same as in the decoder.
+             pad_token: token to be ignored from the input. Only tested with 0.
+             is_training: Whether the model is training or not.
+             max_len: maximum possible output sequence length. Maximum number of objects in the "picture", including sos and eos objects.
+             teacher_learning: Whether to force teacher learning a.k.a. to give the decoder the ground truth as input while training.
+             freeze_encoder: whether to freeze the encoder's weights. It supersedes the encoder's freeze parameter if True.
+
+        """
+
         super(Seq2Seq, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.vocab = vocab
         self.teacher_learning = teacher_learning
-        self.output_l_size = len(vocab['index2word'])
+        self.output_l_size = vocab_size
+        self.pad_token = pad_token
         self.is_training = is_training
         self.max_len = max_len
-        self.temperature = 0.4
+        self.temperature = 0.9
         self.xy_distribution_size = self.decoder.xy_distribution_size
         self.pretrained_encoder = pretrained_encoder
         self.freeze_encoder = freeze_encoder
-
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         if self.freeze_encoder:
             self.encoder.eval()
-               
-    def change_is_training(self, is_training):
+    def test(self):
+        ekisde = torch.zeros(5).cuda()
+        print(ekisde.get_device())
+        print(torch.cuda.get_device_name(ekisde.get_device()))
+    def train(self):
+        self.is_training = True
+        for param in self.parameters():
+            param.requires_grad = True
+        self.decoder.train()
+        if not self.freeze_encoder:
+            self.encoder.train()
+        else:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+    def eval(self):
+        self.is_training = False
+        self.decoder.eval()
+        self.encoder.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, input_ids, attention_masks, target_l=None, target_x=None, target_y=None, target_w=None, target_h=None):
         """
-        Function to update is_training value
+        Takes tokenized sentences and outputs bounding boxes with their classes
+
+        Args:
+            input_ids: tensor of tokens of each sentence (batch_size, seq_len)
+            attention_mask: tensor of 0s and 1s to mask out padded input.
+            target_l: Tensor of size (output_seq_len, batch_size). Ground truth classes
+            target_x: Tensor of size (output_seq_len, batch_size). Ground truth x coordinates
+            target_y: Tensor of size (output_seq_len, batch_size). Ground truth y coordinates
+            target_w: Tensor of size (output_seq_len, batch_size). Ground truth widths
+            target_h: Tensor of size (output_seq_len, batch_size). Ground truth heights
+        Outputs: A dictionary with the following keys:
+            "output_class": Tensor of size (output_seq_len, batch_size, self.decoder.output_size), probability distribution of each output bbox's class
+            "output_bbox": Tensor of size (output_seq_len, batch_size, 4), x,y,w,h of each bbox
+            "outputs_bbox_xy": Tensor of size (output_seq_len, batch_size, xy_distribution_size^2), probability distribution of each bbox's position in the grid.
+            "l_match": number of classes correctly predicted
+            "total": number of total bboxes
         """
-        self.is_training = is_training
-        self.decoder.is_training = is_training
-
-    def convert_objects_to_list(self, coco_boxes, coco_ids, coco_to_img):
-        """
-        Function to reorganize the bounding boxes and classes
-        """
-        # Longest sequence. The minimum value is 3 <sos> class <eos>
-        maximum = 3
-        target_l_variables_list, target_x_variables_list, target_y_variables_list, target_w_variables_list, target_h_variables_list = [], [], [], [], []
-        target_coco_to_img_list = []
-        # First split the class/bounding box in list according to which image belongs each one
-        for i in range(coco_to_img.max()+1):
-            object_idx = np.where(coco_to_img.cpu().numpy()==i)[0]
-            target_l_variables_list.append(coco_ids[object_idx[0]: object_idx[-1]+1])
-            target_x_variables_list.append(coco_boxes[:, 0][object_idx[0]: object_idx[-1]+1])
-            target_y_variables_list.append(coco_boxes[:, 1][object_idx[0]: object_idx[-1]+1])
-            target_w_variables_list.append(coco_boxes[:, 2][object_idx[0]: object_idx[-1]+1])
-            target_h_variables_list.append(coco_boxes[:, 3][object_idx[0]: object_idx[-1]+1])
-            target_coco_to_img_list.append(coco_to_img[object_idx[0]: object_idx[-1]+1])
-            maximum = max(maximum, len(target_l_variables_list[-1]))
-
-        # here we add padding according to the caption that has the maximum number of objects
-        target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables = [], [], [], [], []
-        target_coco_to_img = []
-        for i in range(len(target_l_variables_list)):
-            s = len(target_l_variables_list[i])
-            target_l, target_x, target_y, target_w, target_h, target_c_t_i = torch.zeros(maximum, dtype=torch.int64), torch.zeros(maximum), torch.zeros(maximum), torch.zeros(maximum), torch.zeros(maximum), torch.empty(maximum).fill_(i)
-            target_l[:s], target_x[:s], target_y[:s], target_w[:s], target_h[:s], target_c_t_i[:s] = target_l_variables_list[i], target_x_variables_list[i], target_y_variables_list[i], target_w_variables_list[i], target_h_variables_list[i], target_coco_to_img_list[i]
-            target_l_variables.append(target_l)
-            target_x_variables.append(target_x)
-            target_y_variables.append(target_y)
-            target_w_variables.append(target_w)
-            target_h_variables.append(target_h)
-            target_coco_to_img.append(target_c_t_i)
-        target_l_variables = torch.stack(target_l_variables)
-        target_x_variables = torch.stack(target_x_variables)
-        target_y_variables = torch.stack(target_y_variables)
-        target_w_variables = torch.stack(target_w_variables)
-        target_h_variables = torch.stack(target_h_variables)
-        target_coco_to_img = torch.stack(target_coco_to_img)
-        
-        # Convert the x, y coordinates to coordinates in the grid
-        target_x_coordinates = torch.zeros((target_x_variables.shape[0], target_x_variables.shape[1]))
-        target_y_coordinates = torch.zeros((target_y_variables.shape[0], target_y_variables.shape[1]))
-        for i in range(target_x_variables.shape[1]):
-            coordinates = self.convert_to_coordinates(self.convert_from_coordinates(torch.cat((target_x_variables[:, i].unsqueeze(1), target_y_variables[:, i].unsqueeze(1)), dim=1)).argmax(1).unsqueeze(1))
-
-            target_x_coordinates[:, i] = coordinates[:, 0]
-            target_y_coordinates[:, i] = coordinates[:, 1]
-
-        target_x_variables = target_x_coordinates
-        target_y_variables = target_y_coordinates
-        # Convert to cuda   
-        if torch.cuda.is_available():
-            target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables, target_coco_to_img = target_l_variables.cuda(), target_x_variables.cuda(), target_y_variables.cuda(), target_w_variables.cuda(), target_h_variables.cuda(), target_coco_to_img.cuda()
-        return target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables, target_coco_to_img
-
-    def forward(self, inputs_ids, attention_masks, coco_boxes, coco_ids, coco_to_img):
-        
         # Store the matches
         l_match, total = 0, 0
 
-        # Obtain the targets
-        target_l, target_x, target_y, target_w, target_h, target_coco_to_img = self.convert_objects_to_list(coco_boxes, coco_ids, coco_to_img)
-
         # Encode the input
-        decoder_hidden = self.encoder(inputs_ids, attention_masks)
-        decoder_hidden = decoder_hidden.unsqueeze(0)
+        decoder_hidden = self.encoder(input_ids, attention_masks)
+        decoder_hidden = decoder_hidden.unsqueeze(0).contiguous()
+        decoder_hidden = (decoder_hidden, decoder_hidden)
+        
+        #decoder_hidden = (decoder_hidden.contiguous(), decoder_hidden.contiguous())
 
-        # decoder_hidden = (decoder_hidden.contiguous(), decoder_hidden.contiguous())
-        decoder_hidden = decoder_hidden.contiguous()
+        #decoder_hidden = decoder_hidden.contiguous()
 
         # Obtain the batch size
-        batch_size = decoder_hidden.size(1)
+        #esto antes estaba: decoder_hidden.size(0) pero no funcionaba
+    
+        batch_size = decoder_hidden[0].size(1)
 
-        # Establish the longest length of the input
-        trg_len = target_l.size(1)
-
-        # tensors to store the outputs of the decoder
-        outputs_class = torch.zeros(trg_len, target_l.size(0), self.decoder.output_size)
-        outputs_bbox = torch.zeros(trg_len, target_l.size(0), 4)
-        outputs_bbox_xy = torch.zeros(trg_len, target_l.size(0), self.xy_distribution_size ** 2)
-        target_xy = torch.zeros(trg_len, target_l.size(0))
         
-        # Convert to cuda
-        if torch.cuda.is_available():
-            outputs_class = outputs_class.cuda()
-            outputs_bbox = outputs_bbox.cuda()
-            outputs_bbox_xy = outputs_bbox_xy.cuda()
-            target_xy = target_xy.cuda()
-
         # Create the <sos> token
         trg_l = torch.ones(batch_size, dtype=torch.long)
         if torch.cuda.is_available():
@@ -140,42 +117,67 @@ class Seq2Seq(nn.Module):
         # When training retrieve the next ground truth class and bbox to apply teacher forcing
         # When validating we don't have this information so we set next_l and next_xy to None
         if self.is_training and self.teacher_learning:
-            next_l = torch.FloatTensor(target_l.size(0), self.output_l_size)
+            next_l = torch.FloatTensor(batch_size, self.output_l_size)
             if torch.cuda.is_available():
                 next_l = next_l.cuda()
                 
             # Prediction of the next class (softmax). Only used for training.
             next_l[next_l != 0] = 0
-            for batch_index in range(target_l.size(0)):
+            for batch_index in range(batch_size):
                 next_l[batch_index, int(target_l[batch_index, 1])] = 1
             
             next_xy = torch.cat((target_x[:, 1].unsqueeze(1), target_y[:, 1].unsqueeze(1)), dim=1)
+            # Establish the longest length of the input
+            trg_len = target_l.size(1)
+
+            # tensors to store the outputs of the decoder
+            outputs_class = torch.zeros(trg_len, batch_size, self.decoder.output_size)
+            outputs_bbox = torch.zeros(trg_len, batch_size, 4)
+            outputs_bbox_xy = torch.zeros(trg_len, batch_size, self.xy_distribution_size ** 2)
+            
+            # Convert to cuda
+            if torch.cuda.is_available():
+                outputs_class = outputs_class.cuda()
+                outputs_bbox = outputs_bbox.cuda()
+                outputs_bbox_xy = outputs_bbox_xy.cuda()
+
+        
         else:
+            # Establish the longest length of the input
+            trg_len = self.max_len
+
+            # tensors to store the outputs of the decoder
+            outputs_class = torch.zeros(trg_len, batch_size, self.decoder.output_size)
+            outputs_bbox = torch.zeros(trg_len, batch_size, 4)
+            outputs_bbox_xy = torch.zeros(trg_len, batch_size, self.xy_distribution_size ** 2)
+            
+            # Convert to cuda
+            if torch.cuda.is_available():
+                outputs_class = outputs_class.cuda()
+                outputs_bbox = outputs_bbox.cuda()
+                outputs_bbox_xy = outputs_bbox_xy.cuda()
+
             next_l = None
             next_xy = None
-
+        #xy_out_sample = np.zeros((batch_size,trg_len,1024))
         # Column by column
         for di in range(1, trg_len):
             # Obtain the output of the decoder
             class_prediction, xy_out, wh_out, decoder_hidden, xy_coordinates = self.decoder(trg_l, trg_x, trg_y, trg_w, trg_h, decoder_hidden, decoder_hidden, next_l=next_l, next_xy=next_xy)
-
             # Save the prediction
             outputs_class[di] = class_prediction
             outputs_bbox[di, :, 2:] = wh_out
-
+            #cpu_xy_out = xy_out.cpu()
+            #xy_out_sample[:,di,:] = cpu_xy_out
+            
             # Sample if the xy_coordinates are not calculated
             if xy_coordinates == None:
-                xy_distance = xy_out.div(self.temperature).exp().clamp(min=1e-5, max=1e5)
-                xy_topi = torch.multinomial(xy_distance, 1)
-                xy_coordinates = self.convert_to_coordinates(xy_topi)
+                raise NotImplementedError("Decoder didn't sample x and y coordinates")
 
             # Save the prediction
             outputs_bbox[di, :, :2] = xy_coordinates # (x, y) coordinates
             outputs_bbox_xy[di] = xy_out # xy probability distribution
             
-            # For calculating afterwards the losses we save the target again
-            target_xy[di] = self.convert_from_coordinates(torch.cat((target_x[:, di].unsqueeze(1), target_y[:, di].unsqueeze(1)), dim=1)).argmax(1)
-
             # When training use the real values of the step for the next one
             # When validating use the predicted values of the step for the next one
             top1 = class_prediction.argmax(1)
@@ -196,11 +198,11 @@ class Seq2Seq(nn.Module):
                 else:
                     # Prediction of the next class (softmax). Only used for training
                     if next_l == None:
-                        next_l = torch.FloatTensor(target_l.size(0), self.output_l_size)
+                        next_l = torch.FloatTensor(batch_size, self.output_l_size)
                         if torch.cuda.is_available():
                             next_l = next_l.cuda()
                     next_l[next_l != 0] = 0
-                    for batch_index in range(target_l.size(0)):
+                    for batch_index in range(batch_size):
                         next_l[batch_index, int(target_l[batch_index, di+1])] = 1
 
                     next_xy = torch.cat((target_x[:, di+1].unsqueeze(1), target_y[:, di+1].unsqueeze(1)), dim=1)
@@ -211,27 +213,42 @@ class Seq2Seq(nn.Module):
             if self.is_training:
                 # Calculate some stats about the output (correct matching without taking into account the padding)                target_tensor = target_l[:, di]
                 target_tensor = target_l[:, di]
-                non_padding = target_tensor.ne(self.vocab['word2index']['<pad>'])
+                non_padding = target_tensor.ne(self.pad_token)
                 l_correct = top1.view(-1).eq(target_tensor).masked_select(non_padding).sum().item()
                 l_match += l_correct
                 total += non_padding.sum().item()
+        #xy_out_sample.dump("xy_out_samples.txt")
+        #raise NotImplementedError('Inference without teacher learning not implemented in seq2seq for TRAN decoder')
         # Return all the information
         final_output = {
             "output_class": outputs_class,
             "output_bbox": outputs_bbox,
             "outputs_bbox_xy": outputs_bbox_xy,
-            "target_l": target_l,
-            "target_x": target_x,
-            "target_y": target_y,
-            "target_w": target_w,
-            "target_h": target_h,
-            "target_xy": target_xy,
             "l_match": l_match,
-            "total": total,
-            "coco_to_img": target_coco_to_img
+            "total": total
         }
         return final_output
+    def generate(self, raw_captions):
+        """
+        Given a batch of raw string sentences it process them to output each sentence's bboxes.
 
+        Args:
+            raw_captions: python list of strings. Each sentence being on a single string.
+        Output: A dictionary with the following keys:
+            "output_class": Tensor of  size (batch_size, output_seq_len). Each bbox's predicted COCO class.
+            "output_bbox": Tensor of size (batch_size, output_seq_len, 4). Each bbox (x,y,w,h)
+        """
+        encoding = self.tokenizer(raw_captions, return_tensors='pt', padding=True, truncation=True)
+        all_inputs_ids = encoding['input_ids']
+        all_attention_masks = encoding['attention_mask']
+        if torch.cuda.is_available():
+            all_inputs_ids = all_inputs_ids.cuda()
+            all_attention_masks = all_attention_masks.cuda()
+        output = self(all_inputs_ids, all_attention_masks)
+        simplified_output = {} #only need actual output, not l_match or total. Clean it if necessary (make class selections, swap dimensions to be batch_size, seq_len)...
+        simplified_output['output_class'] = torch.argmax(output['output_class'], dim=2).permute(1,0)
+        simplified_output['output_bbox'] = output['output_bbox'].permute(1,0,2)
+        return simplified_output
     def _cat_directions(self, h):
         """ If the encoder is bidirectional, do the following transformation.
             (#directions * #layers, #batch, hidden_size) -> (#layers, #batch, #directions * hidden_size)
@@ -309,7 +326,7 @@ class Seq2Seq(nn.Module):
         number_of_sectors = self.xy_distribution_size
 
         # First obtain the coordinates of the matrix
-        x, y = ((input_coordinates*number_of_sectors) % (number_of_sectors**2)).floor_divide(number_of_sectors), input_coordinates.floor_divide(number_of_sectors)
+        x, y = input_coordinates % number_of_sectors, input_coordinates.div(number_of_sectors,rounding_mode='trunc')
 
         # Obtain the [x,y] value in [0, 1] range
         x_value = x.true_divide(number_of_sectors)

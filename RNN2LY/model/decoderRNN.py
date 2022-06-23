@@ -7,12 +7,12 @@ from model.attention import Attention
 
 class DecoderRNN(nn.Module):
     
-    def __init__(self, vocab, hidden_size, is_training, bbox_dimension=128, dropout_p=0.2, use_attention=False, bidirectional=False, xy_distribution_size=16):
+    def __init__(self, vocab_size, hidden_size, is_training, bbox_dimension=128, dropout_p=0.2, use_attention=False, bidirectional=False, xy_distribution_size=16):
 
         super(DecoderRNN, self).__init__()
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
-        self.output_size = len(vocab['index2word'])
+        self.output_size = vocab_size
         self.use_attention = use_attention
         self.bbox_dimension = bbox_dimension
         self.is_training = is_training
@@ -141,6 +141,7 @@ class DecoderRNN(nn.Module):
             # next_xy_decoder_input = [batch_size, bbox_dimension]
         else:
             # Sample
+            #xy_distance = F.normalize(xy_out, dim=1)
             xy_distance = xy_out.div(self.temperature).exp()
             xy_topi = torch.multinomial(xy_distance, 1)
             topi = self.convert_to_coordinates(xy_topi)
@@ -164,7 +165,7 @@ class DecoderRNN(nn.Module):
         number_of_sectors = self.xy_distribution_size
 
         # First obtain the coordinates of the matrix
-        x, y = ((input_coordinates*number_of_sectors) % (number_of_sectors**2)).floor_divide(number_of_sectors), input_coordinates.floor_divide(number_of_sectors)
+        x, y = input_coordinates % number_of_sectors, input_coordinates.div(number_of_sectors,rounding_mode='trunc')
 
         # Obtain the [x,y] value in [0, 1] range
         x_value = x.true_divide(number_of_sectors)

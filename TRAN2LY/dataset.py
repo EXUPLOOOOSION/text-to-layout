@@ -5,7 +5,7 @@ import torch
 import numpy as np
 import os
 
-from transformers import BertTokenizer
+from transformers import BertTokenizer, AutoTokenizer
 
 # from nltk.tokenize import RegexpTokenizer
 
@@ -34,7 +34,7 @@ class CocoDataset(Dataset):
         if white_list != None:
             with open(white_list, "r") as json_file:
                 valid_ids = set(json.load(json_file))
-
+                
         with open(self.dataset_path, "r") as json_file:
             dataset_data = json.load(json_file)
 
@@ -42,28 +42,28 @@ class CocoDataset(Dataset):
             self.image_id_to_filename = {}
             self.image_id_to_size = {}
             self.image_id_to_caption = {}
-            self.seen = {}
-            
-            for annot in dataset_data['annotations']:
-                # If we are using one caption take the first one that appears
-                image_id = annot['image_id']
-                if (self.uq_cap and image_id in self.seen) or (image_id not in valid_ids):
-                    continue
 
-                if image_id in self.seen:
-                    image_id_c = str(image_id) + "-" + str(self.seen[image_id])
-                    self.seen[image_id] += 1
-                else:
-                    image_id_c = str(image_id) + "-" + "0"
-                    self.seen[image_id] = 1
+            for image_id in dataset_data.keys():
+                for i in range(dataset_data[image_id]['valid_captions']):
+                    # If we are using one caption take the first one
+                    if self.uq_cap:
+                        image_id_c = str(image_id)
+                    else:
+                        # All the captions
+                        # Each image can have MORE than one caption therefore we create strings
+                        # of type "00001-1" for the first caption "00001-2" for the second caption
+                        # and so on
+                        image_id_c  = str(image_id) + "-" + str(i)
+                    self.image_id_to_caption[image_id_c] = dataset_data[image_id]['graphs'][i]['caption'].lower()#self.normalize_string(dataset_data[image_id]['graphs'][i]['caption'])
+                    self.image_ids.append(image_id_c)
 
-                self.image_ids.append(image_id_c)
-                self.image_id_to_caption[image_id_c] = annot['caption']
+                    # if we are using one caption after adding one break
+                    if self.uq_cap:
+                        break
 
-            # add information about the picture
-            for image in dataset_data['images']:
-                image_id, height, width, filename = image['id'], image['height'], image['width'], image['file_name']
-                self.image_id_to_filename[str(image_id)] = filename
+                # add information about the picture
+                self.image_id_to_filename[str(image_id)] = dataset_data[image_id]['image_filename']
+                width, height = dataset_data[image_id]['width'], dataset_data[image_id]['height']
                 self.image_id_to_size[str(image_id)] = (width, height)
         
         vocab_remove = False 
@@ -109,14 +109,15 @@ class CocoDataset(Dataset):
                 image_id = object_data['image_id']
                 if str(image_id) in self.image_id_to_filename:
                     self.image_id_to_objects[str(image_id)].append(object_data)
-
+        total=0
         # Delete the instances that has no coco objects
-        total = 0
+        new_image_ids = self.image_ids.copy()
         for id in self.image_ids:
             new = id.split("-")[0]
             if new not in self.image_id_to_objects:
-                self.image_ids.remove(id)
+                new_image_ids.remove(id)
                 total += 1
+        self.image_ids = new_image_ids
         
         print("Number of captions removed from the list without gt objects {}".format(total))
         if vocab_remove:
@@ -201,7 +202,7 @@ class Collator():
 
     def __init__(self):
         # Tokenizer
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
     def __call__(self, batch):
 
@@ -221,7 +222,6 @@ class Collator():
             all_boxes_coco.append(boxes_coco)
             all_ids_coco.append(ids_coco)
             all_idx.append(idx)
-
         encoding = self.tokenizer(captions, return_tensors='pt', padding=True, truncation=True)
         all_inputs_ids = encoding['input_ids']
         all_attention_masks = encoding['attention_mask']

@@ -40,7 +40,59 @@ class Evaluator():
                 break
             output.append([torch.clamp(x[i], 0, 1).item(), torch.clamp(y[i], 0, 1).item(), torch.clamp(w[i], 0, 1).item(), torch.clamp(h[i], 0, 1).item(), int(self.vocab['index2wordint'][int(l[i])])])
         return output
-    
+    def convert_objects_to_list(self, coco_boxes, coco_ids, coco_to_img):
+        """
+        Function to reorganize the bounding boxes and classes
+        """
+        # Longest sequence. The minimum value is 3 <sos> class <eos>
+        target_l_variables_list, target_x_variables_list, target_y_variables_list, target_w_variables_list, target_h_variables_list = [], [], [], [], []
+        
+        target_coco_to_img_list = []
+        # First split the class/bounding box in list according to which image belongs each one
+        for i in range(coco_to_img.max()+1):
+            object_idx = np.where(coco_to_img.cpu().numpy()==i)[0]
+            target_l_variables_list.append(coco_ids[object_idx[0]: object_idx[-1]+1])
+            target_x_variables_list.append(coco_boxes[:, 0][object_idx[0]: object_idx[-1]+1])
+            target_y_variables_list.append(coco_boxes[:, 1][object_idx[0]: object_idx[-1]+1])
+            target_w_variables_list.append(coco_boxes[:, 2][object_idx[0]: object_idx[-1]+1])
+            target_h_variables_list.append(coco_boxes[:, 3][object_idx[0]: object_idx[-1]+1])
+            target_coco_to_img_list.append(coco_to_img[object_idx[0]: object_idx[-1]+1])
+        maximum = self.seq2seq.max_len
+        # here we add padding according to the caption that has the maximum number of objects
+        target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables = [], [], [], [], []
+        target_coco_to_img = []
+        for i in range(len(target_l_variables_list)):
+            s = len(target_l_variables_list[i])
+            target_l, target_x, target_y, target_w, target_h, target_c_t_i = torch.zeros(maximum, dtype=torch.int64), torch.zeros(maximum), torch.zeros(maximum), torch.zeros(maximum), torch.zeros(maximum), torch.empty(maximum).fill_(i)
+            target_l[:s], target_x[:s], target_y[:s], target_w[:s], target_h[:s], target_c_t_i[:s] = target_l_variables_list[i], target_x_variables_list[i], target_y_variables_list[i], target_w_variables_list[i], target_h_variables_list[i], target_coco_to_img_list[i]
+            target_l_variables.append(target_l)
+            target_x_variables.append(target_x)
+            target_y_variables.append(target_y)
+            target_w_variables.append(target_w)
+            target_h_variables.append(target_h)
+            target_coco_to_img.append(target_c_t_i)
+        target_l_variables = torch.stack(target_l_variables)
+        target_x_variables = torch.stack(target_x_variables)
+        target_y_variables = torch.stack(target_y_variables)
+        target_w_variables = torch.stack(target_w_variables)
+        target_h_variables = torch.stack(target_h_variables)
+        target_coco_to_img = torch.stack(target_coco_to_img)
+        # Convert the x, y coordinates to coordinates in the grid
+        target_x_coordinates = torch.zeros((target_x_variables.shape[0], target_x_variables.shape[1]))
+        target_y_coordinates = torch.zeros((target_y_variables.shape[0], target_y_variables.shape[1]))
+        for i in range(target_x_variables.shape[1]):
+            coordinates = self.convert_to_coordinates(self.convert_from_coordinates(torch.cat((target_x_variables[:, i].unsqueeze(1), target_y_variables[:, i].unsqueeze(1)), dim=1)).argmax(1).unsqueeze(1))
+
+            target_x_coordinates[:, i] = coordinates[:, 0]
+            target_y_coordinates[:, i] = coordinates[:, 1]
+
+        target_x_variables = target_x_coordinates
+        target_y_variables = target_y_coordinates
+        # Convert to cuda   
+        if torch.cuda.is_available():
+            target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables, target_coco_to_img = target_l_variables.cuda(), target_x_variables.cuda(), target_y_variables.cuda(), target_w_variables.cuda(), target_h_variables.cuda(), target_coco_to_img.cuda()
+        return target_l_variables, target_x_variables, target_y_variables, target_w_variables, target_h_variables, target_coco_to_img
+
     def filter_redundant_labels(self, predicted):
         """
         This function filters redundant labels using the gaussian dict.
@@ -83,7 +135,8 @@ class Evaluator():
         for batch in tqdm(dl):
             
             captions_padded, captions_length, coco_boxes, coco_ids, coco_to_img, all_idx = batch
-            outputs = self.seq2seq(captions_padded, captions_length, coco_boxes, coco_ids, coco_to_img)
+            target_l_raw, target_x_raw, target_y_raw, target_w_raw, target_h_raw, target_coco_to_img = self.convert_objects_to_list(coco_boxes, coco_ids, coco_to_img)
+            outputs = self.seq2seq(captions_padded, captions_length, target_l=target_l_raw, target_x=target_x_raw, target_y=target_y_raw, target_w=target_w_raw, target_h=target_h_raw)
             
             # Obtain the loss of the class
             output_dim = outputs['output_class'].shape[-1]
@@ -91,7 +144,7 @@ class Evaluator():
             outputs_class =  output_class_clean.view(-1, output_dim)
             # output_class = [trg len*batch size, output dim]
             
-            target_l = outputs['target_l'][:, 1:]
+            target_l = target_l_raw[:, 1:]
             target_l_cleaned = torch.transpose(target_l, 0, 1).contiguous().view(-1)
             # target_l = [batch size*output dim]
 
@@ -103,7 +156,7 @@ class Evaluator():
             output_xy_clean = outputs['outputs_bbox_xy'][1:]
             outputs_xy = output_xy_clean.view(-1, output_xy_dim)
 
-            target_xy = outputs['target_xy'][1:].contiguous().view(-1).long()
+            target_xy = self.convert_from_coordinates_to_flat_idx(target_x_raw, target_y_raw).transpose(0,1)[1:].contiguous().view(-1).long()
             xy_prob_loss = self.loss_bbox_xy(outputs_xy, target_xy)
             
             # MSE of xywh
@@ -111,7 +164,7 @@ class Evaluator():
             output_bbox_clean = outputs['output_bbox'][1:]
             outputs_bbox =  output_bbox_clean.view(-1, output_dim)
 
-            target_x, target_y, target_w, target_h, target_coco_to_img = outputs['target_x'][:, 1:], outputs['target_y'][:, 1:], outputs['target_w'][:, 1:], outputs['target_h'][:, 1:], outputs['coco_to_img'][:, 1:]
+            target_x, target_y, target_w, target_h, target_coco_to_img = target_x_raw[:, 1:], target_y_raw[:, 1:], target_w_raw[:, 1:], target_h_raw[:, 1:], target_coco_to_img[:, 1:]
 
             # Concatenate the [x, y, w, h] coordinates
             target_xywh = torch.zeros(outputs_bbox.shape)
@@ -120,8 +173,8 @@ class Evaluator():
             if torch.cuda.is_available():
                 target_xywh = target_xywh.cuda()
                 target_coco = target_coco.cuda()
-            trg_len = outputs['target_l'].shape[1]
-            batch_size = outputs['target_l'].shape[0]
+            trg_len = target_l_raw.shape[1]
+            batch_size = target_l_raw.shape[0]
             for di in range(trg_len-1): # -1 because we remove the first object
                 target_xywh[di*batch_size:di*batch_size+batch_size, 0] = target_x[:, di]
                 target_xywh[di*batch_size:di*batch_size+batch_size, 1] = target_y[:, di]
@@ -129,14 +182,14 @@ class Evaluator():
                 target_xywh[di*batch_size:di*batch_size+batch_size, 3] = target_h[:, di]
                 target_coco[di*batch_size:di*batch_size+batch_size] = target_coco_to_img[:, di]
 
-            output_compare = torch.zeros(len(output_class_clean), outputs['target_l'].size(0))
+            output_compare = torch.zeros(len(output_class_clean), batch_size)
             for di in range(len(output_class_clean)):
                 # Step di
                 output_compare[di] = output_class_clean[di].argmax(1)
 
             # After finding <pad>, <ukn>, <sos> or <eos> token convert the remaining numbers to 0
             for di in range(len(output_class_clean)):
-                for dj in range(outputs['target_l'].size(0)):
+                for dj in range(batch_size):
                     if output_compare[di, dj] <= 3:
                         output_compare[di:, dj] = 0
 
